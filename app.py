@@ -34,7 +34,31 @@ def save_papers(papers):
         json.dump(papers, f, ensure_ascii=False, indent=2)
 
 # ----------------------
-# 用DeepSeek AI提取文献信息
+# 调用DeepSeek API
+# ----------------------
+def call_deepseek(prompt):
+    try:
+        response = requests.post(
+            DEEPSEEK_API_URL,
+            headers={
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1
+            },
+            timeout=60
+        )
+        if response.status_code == 200:
+            return response.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"API调用失败: {e}")
+    return None
+
+# ----------------------
+# 用AI提取文献信息
 # ----------------------
 def extract_info_by_ai(text):
     try:
@@ -53,30 +77,45 @@ def extract_info_by_ai(text):
 文本内容：
 {text[:3000]}"""
 
-        response = requests.post(
-            DEEPSEEK_API_URL,
-            headers={
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "deepseek-chat",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1
-            },
-            timeout=30
-        )
-
-        if response.status_code == 200:
-            result = response.json()
-            content = result["choices"][0]["message"]["content"]
+        content = call_deepseek(prompt)
+        if content:
             json_match = re.search(r'\{[^}]+\}', content, re.DOTALL)
             if json_match:
-                info = json.loads(json_match.group())
-                return info
+                return json.loads(json_match.group())
     except Exception as e:
         print(f"AI提取失败: {e}")
     return None
+
+# ----------------------
+# 用AI判断两篇文章是否重复
+# ----------------------
+def ai_check_duplicate(new_info, existing_info):
+    """用AI判断新文章和已有文章是否为同一篇"""
+    try:
+        prompt = f"""请判断以下两篇学术论文是否为同一篇文献（可能是不同版本、翻译版、或同一研究）：
+
+新文献：
+- 标题：{new_info.get('title', '')}
+- 作者：{new_info.get('author', '')}
+- 年份：{new_info.get('year', '')}
+
+已有文献：
+- 标题：{existing_info.get('title', '')}
+- 作者：{existing_info.get('author', '')}
+- 年份：{existing_info.get('year', '')}
+
+请只回答JSON格式：
+{{"is_duplicate": true/false, "reason": "简短理由"}}"""
+
+        content = call_deepseek(prompt)
+        if content:
+            json_match = re.search(r'\{[^}]+\}', content, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+                return result.get('is_duplicate', False)
+    except Exception as e:
+        print(f"AI查重失败: {e}")
+    return False
 
 # ----------------------
 # 从PDF提取首页文本
@@ -140,21 +179,39 @@ def extract_info_from_pdf(pdf_path, filename):
         return None
 
 # ----------------------
-# 查重逻辑（模糊匹配）
+# 查重逻辑（先用简单匹配，再用AI确认）
 # ----------------------
-def is_duplicate(new_title, paper_list, threshold=65):
-    if not new_title:
+def check_duplicate(new_info, paper_list):
+    """检查新文献是否重复"""
+    if not new_info or not new_info.get('title'):
         return False, None
+
+    new_title = new_info['title']
     new_clean = re.sub(r'[^\w]', '', new_title.lower()).strip()
+
+    candidates = []  # 候选重复文献
+
     for paper in paper_list:
-        p_title = paper["title"]
+        p_title = paper.get("title", "")
         p_clean = re.sub(r'[^\w]', '', p_title.lower()).strip()
-        if new_clean in p_clean or p_clean in new_clean:
+
+        # 快速筛选：包含匹配或高相似度
+        if new_clean and p_clean:
+            if new_clean in p_clean or p_clean in new_clean:
+                candidates.append(paper)
+                continue
+
+            # 计算相似度
+            common = set(new_clean) & set(p_clean)
+            rate = len(common) / max(len(new_clean), len(p_clean)) * 100
+            if rate >= 60:
+                candidates.append(paper)
+
+    # 对候选文献用AI确认
+    for paper in candidates:
+        if ai_check_duplicate(new_info, paper):
             return True, paper
-        common = set(new_clean) & set(p_clean)
-        rate = len(common) / max(len(new_clean), len(p_clean)) * 100
-        if rate >= threshold:
-            return True, paper
+
     return False, None
 
 # ----------------------
@@ -172,7 +229,7 @@ def index():
 <style>
 *{box-sizing:border-box}
 body{
-    max-width:950px;
+    max-width:1000px;
     margin:0 auto;
     font-family:'Nunito',-apple-system,sans-serif;
     padding:30px 20px;
@@ -222,9 +279,9 @@ body{
     background:#fce4ec20;
     transition:all 0.3s
 }
-.upload-area:hover{
+.upload-area.dragover{
     border-color:#e91e63;
-    background:#fce4ec40
+    background:#fce4ec60
 }
 .upload-icon{
     font-size:50px;
@@ -253,6 +310,27 @@ body{
     color:#666;
     font-size:0.95em
 }
+.file-list{
+    margin-top:15px;
+    text-align:left;
+    max-height:150px;
+    overflow-y:auto
+}
+.file-item{
+    padding:8px 12px;
+    background:#f5f5f5;
+    margin:5px 0;
+    border-radius:8px;
+    font-size:0.9em;
+    display:flex;
+    justify-content:space-between;
+    align-items:center
+}
+.file-item .remove-btn{
+    color:#e53935;
+    cursor:pointer;
+    font-weight:bold
+}
 .check-btn{
     margin-top:20px;
     padding:14px 40px;
@@ -270,16 +348,42 @@ body{
     transform:translateY(-2px);
     box-shadow:0 6px 20px rgba(124,77,255,0.4)
 }
-.result-box{
-    margin-top:25px;
-    padding:25px;
-    border-radius:15px;
-    display:none;
-    animation:popIn 0.3s ease
+.check-btn:disabled{
+    background:#ccc;
+    cursor:not-allowed;
+    transform:none;
+    box-shadow:none
 }
-@keyframes popIn{
-    from{opacity:0;transform:scale(0.95)}
-    to{opacity:1;transform:scale(1)}
+.progress-section{
+    margin-top:25px;
+    display:none
+}
+.progress-bar{
+    height:10px;
+    background:#f5f5f5;
+    border-radius:10px;
+    overflow:hidden
+}
+.progress-fill{
+    height:100%;
+    background:linear-gradient(135deg,#e91e63,#f48fb1);
+    width:0%;
+    transition:width 0.3s
+}
+.progress-text{
+    margin-top:10px;
+    color:#666;
+    font-size:0.9em
+}
+.result-section{
+    margin-top:25px;
+    display:none
+}
+.result-item{
+    padding:20px;
+    margin:10px 0;
+    border-radius:12px;
+    text-align:left
 }
 .result-duplicate{
     background:linear-gradient(135deg,#ffebee,#ffcdd2);
@@ -290,23 +394,23 @@ body{
     border-left:5px solid #43a047
 }
 .result-title{
-    font-size:1.2em;
     font-weight:700;
-    margin-bottom:15px
+    font-size:1.1em;
+    margin-bottom:8px
 }
-.result-content{
-    color:#555;
-    line-height:1.8
+.result-meta{
+    color:#666;
+    font-size:0.9em
 }
-.paper-match{
+.result-match{
     background:white;
-    padding:15px;
-    border-radius:10px;
-    margin-top:15px;
-    box-shadow:0 2px 10px rgba(0,0,0,0.05)
+    padding:10px;
+    border-radius:8px;
+    margin-top:10px;
+    font-size:0.9em
 }
-.add-btn{
-    margin-top:15px;
+.add-selected-btn{
+    margin-top:20px;
     padding:12px 35px;
     background:linear-gradient(135deg,#00c853,#69f0ae);
     color:white;
@@ -314,12 +418,7 @@ body{
     border-radius:50px;
     cursor:pointer;
     font-weight:700;
-    transition:transform 0.2s,box-shadow 0.2s;
-    box-shadow:0 4px 15px rgba(0,200,83,0.3)
-}
-.add-btn:hover{
-    transform:translateY(-2px);
-    box-shadow:0 6px 20px rgba(0,200,83,0.4)
+    display:none
 }
 .paper-list-section{
     margin-top:40px;
@@ -428,7 +527,6 @@ body{
     padding:20px;
     color:#e91e63
 }
-/* 编辑弹窗 */
 .modal{
     display:none;
     position:fixed;
@@ -501,21 +599,32 @@ body{
 <body>
 <div class="header">
     <h1><span>📚</span> 组会文献查重系统</h1>
-    <p>上传PDF，一键查重，告别重复分享</p>
+    <p>支持批量上传PDF，AI智能识别与查重</p>
     <div class="count-badge">已收录 <span id="count">...</span> 篇文献</div>
 </div>
 
 <div class="upload-section">
-    <div class="upload-area">
+    <div class="upload-area" id="uploadArea">
         <div class="upload-icon">📄</div>
-        <input type="file" id="pdfFile" class="file-input" accept=".pdf">
-        <label for="pdfFile" class="file-label">选择PDF文件</label>
-        <div class="file-name" id="fileName">未选择文件</div>
+        <input type="file" id="pdfFiles" class="file-input" accept=".pdf" multiple>
+        <label for="pdfFiles" class="file-label">选择PDF文件（可多选）</label>
+        <div class="file-name" id="fileName">支持拖拽上传，可一次选择多个文件</div>
+        <div class="file-list" id="fileList"></div>
     </div>
-    <button class="check-btn" onclick="uploadAndCheck()">上传并查重</button>
+    <button class="check-btn" id="checkBtn" onclick="startBatchCheck()" disabled>开始批量查重</button>
+
+    <div class="progress-section" id="progressSection">
+        <div class="progress-bar">
+            <div class="progress-fill" id="progressFill"></div>
+        </div>
+        <div class="progress-text" id="progressText">准备中...</div>
+    </div>
 </div>
 
-<div id="result" class="result-box"></div>
+<div class="result-section" id="resultSection">
+    <div id="resultList"></div>
+    <button class="add-selected-btn" id="addSelectedBtn" onclick="addSelectedPapers()">添加选中的新文献到数据库</button>
+</div>
 
 <div class="paper-list-section">
     <div class="paper-list-header">
@@ -526,7 +635,6 @@ body{
     <div id="paperList" class="loading">加载中...</div>
 </div>
 
-<!-- 编辑弹窗 -->
 <div id="editModal" class="modal">
     <div class="modal-content">
         <h3 class="modal-title">编辑文献信息</h3>
@@ -544,7 +652,6 @@ body{
     </div>
 </div>
 
-<!-- 添加弹窗 -->
 <div id="addModal" class="modal">
     <div class="modal-content">
         <h3 class="modal-title">手动添加文献</h3>
@@ -563,12 +670,50 @@ body{
 
 <script>
 let allPapers = [];
-let lastCheckData = null;
+let selectedFiles = [];
+let checkResults = [];
 
-document.getElementById('pdfFile').addEventListener('change', function(e){
-    let name = e.target.files[0] ? e.target.files[0].name : '未选择文件';
-    document.getElementById('fileName').textContent = name;
+// 文件选择处理
+document.getElementById('pdfFiles').addEventListener('change', function(e){
+    selectedFiles = Array.from(e.target.files);
+    updateFileList();
 });
+
+// 拖拽上传
+const uploadArea = document.getElementById('uploadArea');
+uploadArea.addEventListener('dragover', function(e){
+    e.preventDefault();
+    uploadArea.classList.add('dragover');
+});
+uploadArea.addEventListener('dragleave', function(){
+    uploadArea.classList.remove('dragover');
+});
+uploadArea.addEventListener('drop', function(e){
+    e.preventDefault();
+    uploadArea.classList.remove('dragover');
+    selectedFiles = Array.from(e.dataTransfer.files).filter(f => f.name.toLowerCase().endsWith('.pdf'));
+    updateFileList();
+});
+
+function updateFileList(){
+    let html = '';
+    selectedFiles.forEach((f, i) => {
+        html += `<div class="file-item">
+            <span>📄 ${f.name}</span>
+            <span class="remove-btn" onclick="removeFile(${i})">✕</span>
+        </div>`;
+    });
+    document.getElementById('fileList').innerHTML = html;
+    document.getElementById('checkBtn').disabled = selectedFiles.length === 0;
+    document.getElementById('fileName').textContent = selectedFiles.length > 0
+        ? `已选择 ${selectedFiles.length} 个文件`
+        : '支持拖拽上传，可一次选择多个文件';
+}
+
+function removeFile(index){
+    selectedFiles.splice(index, 1);
+    updateFileList();
+}
 
 async function loadCount(){
     let r = await fetch('/count');
@@ -611,70 +756,114 @@ function filterPapers(){
     renderPapers(filtered);
 }
 
-async function uploadAndCheck(){
-    let file = document.getElementById('pdfFile').files[0];
-    if(!file){alert('请先选择PDF文件');return}
-    let form = new FormData();
-    form.append('pdf', file);
+async function startBatchCheck(){
+    if(selectedFiles.length === 0) return;
 
-    let dom = document.getElementById('result');
-    dom.className = 'result-box';
-    dom.style.display = 'block';
-    dom.innerHTML = '<div class="loading">正在用AI识别文献信息...</div>';
+    document.getElementById('progressSection').style.display = 'block';
+    document.getElementById('resultSection').style.display = 'none';
+    document.getElementById('checkBtn').disabled = true;
 
-    let res = await fetch('/upload-check', {method:'POST', body:form});
-    let data = await res.json();
-    lastCheckData = data;
+    checkResults = [];
 
-    if(data.duplicate){
-        dom.className = 'result-box result-duplicate';
-        dom.innerHTML = `
-            <div class="result-title">❌ 这篇文献已经分享过啦</div>
-            <div class="result-content">
-                <strong>识别标题：</strong>${data.title}<br>
-                <strong>识别作者：</strong>${data.full_info?.author || '未知'}<br>
-                <strong>识别年份：</strong>${data.full_info?.year || '未知'}
-                <div class="paper-match">
-                    <strong>已存在记录：</strong><br>
-                    ${data.paper.title}<br>
-                    <small>作者：${data.paper.author} | 年份：${data.paper.year}</small>
-                </div>
-            </div>`;
-    } else {
-        dom.className = 'result-box result-new';
-        dom.innerHTML = `
-            <div class="result-title">✅ 这是一篇新文献，可以分享</div>
-            <div class="result-content">
-                <strong>识别标题：</strong>${data.title}<br>
-                <strong>识别作者：</strong>${data.full_info?.author || '未知'}<br>
-                <strong>识别年份：</strong>${data.full_info?.year || '未知'}
-                <br><br>
-                <button class="add-btn" onclick="addToDatabase()">添加到数据库</button>
-            </div>`;
+    for(let i = 0; i < selectedFiles.length; i++){
+        let file = selectedFiles[i];
+        document.getElementById('progressText').textContent = `正在处理: ${file.name} (${i+1}/${selectedFiles.length})`;
+        document.getElementById('progressFill').style.width = ((i+1) / selectedFiles.length * 100) + '%';
+
+        let form = new FormData();
+        form.append('pdf', file);
+
+        try{
+            let res = await fetch('/upload-check', {method:'POST', body:form});
+            let data = await res.json();
+            checkResults.push({
+                filename: file.name,
+                ...data
+            });
+        }catch(e){
+            checkResults.push({
+                filename: file.name,
+                error: true
+            });
+        }
     }
+
+    showResults();
 }
 
-async function addToDatabase(){
-    if(!lastCheckData || !lastCheckData.full_info){
-        alert('请先上传并查重');
+function showResults(){
+    document.getElementById('progressSection').style.display = 'none';
+    document.getElementById('resultSection').style.display = 'block';
+    document.getElementById('checkBtn').disabled = false;
+
+    let html = '';
+    let newCount = 0;
+
+    checkResults.forEach((r, i) => {
+        if(r.error){
+            html += `<div class="result-item" style="background:#fff3e0;border-left:5px solid #ff9800">
+                <div class="result-title">⚠️ 处理失败</div>
+                <div class="result-meta">${r.filename}</div>
+            </div>`;
+        } else if(r.duplicate){
+            html += `<div class="result-item result-duplicate">
+                <div class="result-title">❌ 已存在</div>
+                <div class="result-meta">
+                    <strong>${r.title}</strong><br>
+                    作者：${r.full_info?.author || '未知'} | 年份：${r.full_info?.year || '未知'}
+                </div>
+                <div class="result-match">
+                    匹配到已有文献：<br>
+                    ${r.paper?.title || ''}<br>
+                    <small>作者：${r.paper?.author || ''} | 年份：${r.paper?.year || ''}</small>
+                </div>
+            </div>`;
+        } else {
+            newCount++;
+            html += `<div class="result-item result-new">
+                <input type="checkbox" id="check${i}" checked style="margin-right:10px">
+                <div style="display:inline-block;vertical-align:top;width:calc(100% - 30px)">
+                    <div class="result-title">✅ 新文献</div>
+                    <div class="result-meta">
+                        <strong>${r.title}</strong><br>
+                        作者：${r.full_info?.author || '未知'} | 年份：${r.full_info?.year || '未知'}
+                    </div>
+                </div>
+            </div>`;
+        }
+    });
+
+    document.getElementById('resultList').innerHTML = html;
+    document.getElementById('addSelectedBtn').style.display = newCount > 0 ? 'block' : 'none';
+}
+
+async function addSelectedPapers(){
+    let toAdd = [];
+    checkResults.forEach((r, i) => {
+        if(!r.error && !r.duplicate && document.getElementById('check'+i)?.checked){
+            toAdd.push(r.full_info);
+        }
+    });
+
+    if(toAdd.length === 0){
+        alert('请至少选择一篇文献');
         return;
     }
 
-    let res = await fetch('/add-paper', {
+    let res = await fetch('/batch-add-papers', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(lastCheckData.full_info)
+        body: JSON.stringify({papers: toAdd})
     });
     let data = await res.json();
 
     if(data.success){
-        let dom = document.getElementById('result');
-        dom.innerHTML = '<div class="result-title">🎉 已成功添加到数据库</div>';
+        alert(`成功添加 ${data.added} 篇文献`);
+        document.getElementById('resultSection').style.display = 'none';
+        selectedFiles = [];
+        updateFileList();
         loadCount();
         loadPapers();
-        lastCheckData = null;
-    } else {
-        alert('添加失败：' + (data.error || '未知错误'));
     }
 }
 
@@ -710,9 +899,6 @@ async function saveEdit(){
     if(data.success){
         closeModal();
         loadPapers();
-        loadCount();
-    } else {
-        alert('保存失败');
     }
 }
 
@@ -729,8 +915,6 @@ async function deletePaper(index){
     if(data.success){
         loadPapers();
         loadCount();
-    } else {
-        alert('删除失败');
     }
 }
 
@@ -769,8 +953,6 @@ async function manualAdd(){
         closeAddModal();
         loadPapers();
         loadCount();
-    } else {
-        alert('添加失败：' + (data.error || '未知错误'));
     }
 }
 
@@ -812,22 +994,23 @@ def upload_check():
     file.save(path)
 
     full_info = extract_info_from_pdf(path, filename)
-    title = full_info['title'] if full_info else "无法识别标题"
-
-    papers = load_papers()
-    dup, paper = is_duplicate(title, papers)
-
     os.remove(path)
 
+    if not full_info:
+        return jsonify({"error": "extract failed"}), 500
+
+    papers = load_papers()
+    dup, paper = check_duplicate(full_info, papers)
+
     return jsonify({
-        "title": title,
+        "title": full_info['title'],
         "duplicate": dup,
         "paper": paper,
         "full_info": full_info
     })
 
 # ----------------------
-# 接口：添加文献
+# 接口：添加单篇文献
 # ----------------------
 @app.route('/add-paper', methods=['POST'])
 def add_paper():
@@ -836,10 +1019,6 @@ def add_paper():
         return jsonify({"error": "missing data"}), 400
 
     papers = load_papers()
-    dup, _ = is_duplicate(data['title'], papers)
-    if dup:
-        return jsonify({"error": "already exists"}), 400
-
     new_paper = {
         "title": data.get('title', '未知'),
         "author": data.get('author', '未知'),
@@ -850,6 +1029,33 @@ def add_paper():
     save_papers(papers)
 
     return jsonify({"success": True, "paper": new_paper})
+
+# ----------------------
+# 接口：批量添加文献
+# ----------------------
+@app.route('/batch-add-papers', methods=['POST'])
+def batch_add_papers():
+    data = request.json
+    papers_to_add = data.get('papers', [])
+
+    if not papers_to_add:
+        return jsonify({"error": "no papers"}), 400
+
+    papers = load_papers()
+    added = 0
+
+    for p in papers_to_add:
+        if p and p.get('title'):
+            papers.append({
+                "title": p.get('title', '未知'),
+                "author": p.get('author', '未知'),
+                "year": p.get('year', '未知'),
+                "filename": p.get('filename', '')
+            })
+            added += 1
+
+    save_papers(papers)
+    return jsonify({"success": True, "added": added})
 
 # ----------------------
 # 接口：更新文献
