@@ -31,12 +31,25 @@ def init_db():
                   year TEXT,
                   filename TEXT)''')
 
-    # 用户表
+    # 用户表（增加is_admin字段）
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   username TEXT UNIQUE,
                   password TEXT,
-                  api_key TEXT)''')
+                  api_key TEXT,
+                  is_admin INTEGER DEFAULT 0)''')
+
+    # 检查是否需要添加is_admin字段（兼容旧数据库）
+    c.execute("PRAGMA table_info(users)")
+    columns = [col[1] for col in c.fetchall()]
+    if 'is_admin' not in columns:
+        c.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+
+    # 创建默认管理员账号（用户名: admin, 密码: admin123）
+    c.execute("SELECT * FROM users WHERE username = 'admin'")
+    if not c.fetchone():
+        c.execute("INSERT INTO users (username, password, api_key, is_admin) VALUES (?, ?, ?, 1)",
+                  ('admin', hash_password('admin123'), ''))
 
     conn.commit()
     conn.close()
@@ -65,7 +78,7 @@ def create_user(username, password):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO users (username, password, api_key) VALUES (?, ?, ?)",
+        c.execute("INSERT INTO users (username, password, api_key, is_admin) VALUES (?, ?, ?, 0)",
                   (username, hash_password(password), ''))
         conn.commit()
         conn.close()
@@ -80,6 +93,24 @@ def update_user_api_key(username, api_key):
     c.execute("UPDATE users SET api_key = ? WHERE username = ?", (api_key, username))
     conn.commit()
     conn.close()
+
+def get_all_users():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id, username, is_admin FROM users")
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": r["id"], "username": r["username"], "is_admin": r["is_admin"]} for r in rows]
+
+def delete_user_by_id(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM users WHERE id = ? AND is_admin = 0", (user_id,))  # 不能删除管理员
+    conn.commit()
+    affected = c.rowcount
+    conn.close()
+    return affected > 0
 
 # ----------------------
 # 文献相关函数
@@ -769,6 +800,7 @@ body{{max-width:1000px;margin:0 auto;font-family:'Nunito',-apple-system,sans-ser
     <div class="user-info">
         <span class="user-name">👤 {session['user']}</span>
         <span class="api-status" id="apiStatus">检查中...</span>
+        {'<a href="/admin" style="margin-left:15px;color:#e91e63;font-weight:600">🔧 管理后台</a>' if user.get('is_admin') else ''}
     </div>
     <button class="logout-btn" onclick="location.href='/api/logout'">退出登录</button>
 </div>
@@ -1206,6 +1238,113 @@ def delete_paper():
 
     delete_paper_from_db(index)
     return jsonify({"success": True})
+
+# ----------------------
+# 管理员页面
+# ----------------------
+@app.route('/admin')
+def admin_page():
+    if 'user' not in session:
+        return '<script>alert("请先登录");location.href="/login"</script>'
+
+    user = get_user_by_username(session['user'])
+    if not user or not user.get('is_admin'):
+        return '<script>alert("无权限访问");location.href="/"</script>'
+
+    users = get_all_users()
+    papers = load_papers()
+
+    user_list_html = ''
+    for u in users:
+        if u['is_admin']:
+            user_list_html += f'<tr><td>{u["username"]}</td><td><span style="color:#e91e63">管理员</span></td><td>-</td></tr>'
+        else:
+            user_list_html += f'<tr><td>{u["username"]}</td><td>普通用户</td><td><button onclick="deleteUser({u["id"]})" style="background:#ffebee;color:#e53935;border:none;padding:5px 15px;border-radius:5px;cursor:pointer">删除</button></td></tr>'
+
+    paper_list_html = ''
+    for i, p in enumerate(papers):
+        paper_list_html += f'<tr><td>{i+1}</td><td>{p["title"][:60]}...</td><td>{p["author"]}</td><td>{p["year"]}</td></tr>'
+
+    return f'''
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>管理员后台</title>
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+*{{box-sizing:border-box}}
+body{{max-width:1000px;margin:0 auto;font-family:'Nunito',-apple-system,sans-serif;padding:30px 20px;background:linear-gradient(135deg,#fce4ec 0%,#e3f2fd 100%);min-height:100vh}}
+h1{{color:#e91e63;text-align:center}}
+h2{{color:#333;margin-top:30px}}
+.back-btn{{display:inline-block;padding:10px 20px;background:#f5f5f5;color:#666;text-decoration:none;border-radius:20px;margin-bottom:20px}}
+.back-btn:hover{{background:#eee}}
+.section{{background:white;padding:25px;border-radius:15px;margin:20px 0;box-shadow:0 4px 15px rgba(0,0,0,0.05)}}
+table{{width:100%;border-collapse:collapse;margin-top:15px}}
+th,td{{padding:12px;text-align:left;border-bottom:1px solid #eee}}
+th{{background:#f5f5f5;font-weight:600}}
+tr:hover{{background:#fafafa}}
+</style>
+</head>
+<body>
+<a href="/" class="back-btn">← 返回主页</a>
+<h1>🔧 管理员后台</h1>
+
+<div class="section">
+    <h2>👥 用户管理</h2>
+    <table>
+        <tr><th>用户名</th><th>角色</th><th>操作</th></tr>
+        {user_list_html}
+    </table>
+</div>
+
+<div class="section">
+    <h2>📚 文献库 (共 {len(papers)} 篇)</h2>
+    <table>
+        <tr><th>#</th><th>标题</th><th>作者</th><th>年份</th></tr>
+        {paper_list_html}
+    </table>
+</div>
+
+<script>
+async function deleteUser(userId){{
+    if(!confirm('确定要删除这个用户吗？')) return;
+    let res = await fetch('/admin/delete-user', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{user_id: userId}})
+    }});
+    let data = await res.json();
+    if(data.success){{
+        alert('删除成功');
+        location.reload();
+    }} else {{
+        alert('删除失败：' + data.error);
+    }}
+}}
+</script>
+</body>
+</html>
+'''
+
+# ----------------------
+# 接口：管理员删除用户
+# ----------------------
+@app.route('/admin/delete-user', methods=['POST'])
+def admin_delete_user():
+    if 'user' not in session:
+        return jsonify({"error": "not logged in"}), 401
+
+    user = get_user_by_username(session['user'])
+    if not user or not user.get('is_admin'):
+        return jsonify({"error": "no permission"}), 403
+
+    data = request.json
+    user_id = data.get('user_id')
+
+    if delete_user_by_id(user_id):
+        return jsonify({"success": True})
+    return jsonify({"error": "cannot delete admin or user not found"}), 400
 
 if __name__ == '__main__':
     import os
