@@ -14,7 +14,38 @@ app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 DB_FILE = "papers.db"
-DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+
+# 支持的AI模型配置
+AI_MODELS = {
+    "deepseek": {
+        "name": "DeepSeek",
+        "url": "https://api.deepseek.com/v1/chat/completions",
+        "model": "deepseek-chat",
+        "key_prefix": "sk-",
+        "get_key_url": "https://platform.deepseek.com"
+    },
+    "zhipu": {
+        "name": "智谱AI (GLM)",
+        "url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        "model": "glm-4-flash",
+        "key_prefix": "",
+        "get_key_url": "https://open.bigmodel.cn"
+    },
+    "qwen": {
+        "name": "通义千问",
+        "url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "model": "qwen-turbo",
+        "key_prefix": "sk-",
+        "get_key_url": "https://dashscope.console.aliyun.com"
+    },
+    "doubao": {
+        "name": "豆包",
+        "url": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+        "model": "doubao-pro-32k",
+        "key_prefix": "",
+        "get_key_url": "https://console.volcengine.com/ark"
+    }
+}
 
 # ----------------------
 # 初始化数据库
@@ -31,25 +62,28 @@ def init_db():
                   year TEXT,
                   filename TEXT)''')
 
-    # 用户表（增加is_admin字段）
+    # 用户表
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   username TEXT UNIQUE,
                   password TEXT,
                   api_key TEXT,
+                  api_provider TEXT DEFAULT 'deepseek',
                   is_admin INTEGER DEFAULT 0)''')
 
-    # 检查是否需要添加is_admin字段（兼容旧数据库）
+    # 检查是否需要添加新字段
     c.execute("PRAGMA table_info(users)")
     columns = [col[1] for col in c.fetchall()]
     if 'is_admin' not in columns:
         c.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+    if 'api_provider' not in columns:
+        c.execute("ALTER TABLE users ADD COLUMN api_provider TEXT DEFAULT 'deepseek'")
 
-    # 创建默认管理员账号（用户名: admin, 密码: admin123）
+    # 创建默认管理员账号
     c.execute("SELECT * FROM users WHERE username = 'admin'")
     if not c.fetchone():
-        c.execute("INSERT INTO users (username, password, api_key, is_admin) VALUES (?, ?, ?, 1)",
-                  ('admin', hash_password('admin123'), ''))
+        c.execute("INSERT INTO users (username, password, api_key, api_provider, is_admin) VALUES (?, ?, ?, ?, 1)",
+                  ('admin', hash_password('admin123'), '', 'deepseek'))
 
     conn.commit()
     conn.close()
@@ -87,10 +121,10 @@ def create_user(username, password):
         conn.close()
         return False
 
-def update_user_api_key(username, api_key):
+def update_user_api_key(username, api_key, api_provider='deepseek'):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("UPDATE users SET api_key = ? WHERE username = ?", (api_key, username))
+    c.execute("UPDATE users SET api_key = ?, api_provider = ? WHERE username = ?", (api_key, api_provider, username))
     conn.commit()
     conn.close()
 
@@ -98,15 +132,15 @@ def get_all_users():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute("SELECT id, username, is_admin FROM users")
+    c.execute("SELECT id, username, is_admin, api_provider FROM users")
     rows = c.fetchall()
     conn.close()
-    return [{"id": r["id"], "username": r["username"], "is_admin": r["is_admin"]} for r in rows]
+    return [{"id": r["id"], "username": r["username"], "is_admin": r["is_admin"], "api_provider": r["api_provider"]} for r in rows]
 
 def delete_user_by_id(user_id):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("DELETE FROM users WHERE id = ? AND is_admin = 0", (user_id,))  # 不能删除管理员
+    c.execute("DELETE FROM users WHERE id = ? AND is_admin = 0", (user_id,))
     conn.commit()
     affected = c.rowcount
     conn.close()
@@ -156,30 +190,51 @@ def delete_paper_from_db(index):
 # ----------------------
 # AI相关函数
 # ----------------------
-def call_deepseek(prompt, api_key):
-    if not api_key:
+def call_ai(prompt, api_key, provider='deepseek'):
+    """调用AI API，支持多个模型"""
+    if not api_key or provider not in AI_MODELS:
         return None
+
+    config = AI_MODELS[provider]
     try:
+        headers = {
+            "Content-Type": "application/json"
+        }
+
+        # 不同模型的认证方式
+        if provider == "zhipu":
+            headers["Authorization"] = f"Bearer {api_key}"
+        elif provider == "doubao":
+            headers["Authorization"] = f"Bearer {api_key}"
+        else:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        payload = {
+            "model": config["model"],
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1
+        }
+
         response = requests.post(
-            DEEPSEEK_API_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "deepseek-chat",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1
-            },
+            config["url"],
+            headers=headers,
+            json=payload,
             timeout=60
         )
+
         if response.status_code == 200:
             return response.json()["choices"][0]["message"]["content"]
+        else:
+            print(f"API错误 ({provider}): {response.status_code} - {response.text}")
     except Exception as e:
-        print(f"API调用失败: {e}")
+        print(f"API调用失败 ({provider}): {e}")
     return None
 
-def extract_info_by_ai(text, api_key):
+# 保留旧函数名兼容
+def call_deepseek(prompt, api_key):
+    return call_ai(prompt, api_key, 'deepseek')
+
+def extract_info_by_ai(text, api_key, provider='deepseek'):
     try:
         prompt = f"""请从以下学术论文首页文本中提取信息，以JSON格式返回：
 {{
@@ -196,7 +251,7 @@ def extract_info_by_ai(text, api_key):
 文本内容：
 {text[:3000]}"""
 
-        content = call_deepseek(prompt, api_key)
+        content = call_ai(prompt, api_key, provider)
         if content:
             json_match = re.search(r'\{[^}]+\}', content, re.DOTALL)
             if json_match:
@@ -205,7 +260,7 @@ def extract_info_by_ai(text, api_key):
         print(f"AI提取失败: {e}")
     return None
 
-def ai_check_duplicate(new_info, existing_info, api_key):
+def ai_check_duplicate(new_info, existing_info, api_key, provider='deepseek'):
     try:
         prompt = f"""请判断以下两篇学术论文是否为同一篇文献：
 
@@ -222,7 +277,7 @@ def ai_check_duplicate(new_info, existing_info, api_key):
 请只回答JSON格式：
 {{"is_duplicate": true/false, "reason": "简短理由"}}"""
 
-        content = call_deepseek(prompt, api_key)
+        content = call_ai(prompt, api_key, provider)
         if content:
             json_match = re.search(r'\{[^}]+\}', content, re.DOTALL)
             if json_match:
@@ -241,10 +296,10 @@ def extract_text_from_pdf(pdf_path):
         pass
     return ""
 
-def extract_info_from_pdf(pdf_path, filename, api_key):
+def extract_info_from_pdf(pdf_path, filename, api_key, provider='deepseek'):
     try:
         text = extract_text_from_pdf(pdf_path)
-        ai_info = extract_info_by_ai(text, api_key) if api_key else None
+        ai_info = extract_info_by_ai(text, api_key, provider) if api_key else None
 
         if ai_info:
             if ai_info.get('year') == '未知' or not ai_info.get('year'):
@@ -286,7 +341,7 @@ def extract_info_from_pdf(pdf_path, filename, api_key):
     except Exception as e:
         return None
 
-def check_duplicate(new_info, paper_list, api_key):
+def check_duplicate(new_info, paper_list, api_key, provider='deepseek'):
     if not new_info or not new_info.get('title'):
         return False, None
 
@@ -310,7 +365,7 @@ def check_duplicate(new_info, paper_list, api_key):
     # 有API Key时用AI确认
     if api_key:
         for paper in candidates:
-            if ai_check_duplicate(new_info, paper, api_key):
+            if ai_check_duplicate(new_info, paper, api_key, provider):
                 return True, paper
     else:
         # 无API Key时直接返回第一个候选
@@ -662,7 +717,7 @@ def api_logout():
     return jsonify({"success": True})
 
 # ----------------------
-# API接口：获取/设置API Key
+# API接口：获取/设置API Key和模型
 # ----------------------
 @app.route('/api/user/apikey', methods=['GET', 'POST'])
 def api_user_apikey():
@@ -671,12 +726,22 @@ def api_user_apikey():
 
     if request.method == 'GET':
         user = get_user_by_username(session['user'])
-        return jsonify({"api_key": user.get('api_key', '')})
+        return jsonify({
+            "api_key": user.get('api_key', ''),
+            "api_provider": user.get('api_provider', 'deepseek')
+        })
 
     data = request.json
     api_key = data.get('api_key', '')
-    update_user_api_key(session['user'], api_key)
+    api_provider = data.get('api_provider', 'deepseek')
+    update_user_api_key(session['user'], api_key, api_provider)
     return jsonify({"success": True})
+
+# API接口：获取支持的AI模型列表
+# ----------------------
+@app.route('/api/models')
+def api_models():
+    return jsonify(AI_MODELS)
 
 # ----------------------
 # 主页面
@@ -872,10 +937,20 @@ body{{max-width:1000px;margin:0 auto;font-family:'Nunito',-apple-system,sans-ser
 
 <div id="apiKeyModal" class="modal">
     <div class="modal-content">
-        <h3 class="modal-title">设置 DeepSeek API Key</h3>
-        <p style="color:#666;font-size:0.9em;margin-bottom:15px">使用自己的API Key进行AI查重，费用自理。<br>获取地址：<a href="https://platform.deepseek.com" target="_blank">platform.deepseek.com</a></p>
+        <h3 class="modal-title">设置 AI 模型 API</h3>
+        <p style="color:#666;font-size:0.9em;margin-bottom:15px">选择AI模型并输入对应的API Key，费用自理。</p>
+        <label class="modal-label">选择模型</label>
+        <select id="apiProvider" class="modal-input" style="cursor:pointer" onchange="updateModelInfo()">
+            <option value="deepseek">DeepSeek</option>
+            <option value="zhipu">智谱AI (GLM)</option>
+            <option value="qwen">通义千问</option>
+            <option value="doubao">豆包</option>
+        </select>
+        <div id="modelInfo" style="background:#f5f5f5;padding:10px;border-radius:8px;margin-bottom:15px;font-size:0.85em">
+            <div><strong>获取地址：</strong><a id="modelUrl" href="https://platform.deepseek.com" target="_blank">platform.deepseek.com</a></div>
+        </div>
         <label class="modal-label">API Key</label>
-        <input type="text" id="apiKeyInput" class="modal-input" placeholder="sk-xxxxxxxxxxxxxxxx">
+        <input type="text" id="apiKeyInput" class="modal-input" placeholder="输入API Key">
         <div class="modal-btns">
             <button class="modal-btn modal-cancel" onclick="closeApiKeyModal()">取消</button>
             <button class="modal-btn modal-save" onclick="saveApiKey()">保存</button>
@@ -888,25 +963,49 @@ let allPapers = [];
 let selectedFiles = [];
 let checkResults = [];
 let userApiKey = '';
+let userApiProvider = 'deepseek';
+
+const modelUrls = {{
+    'deepseek': 'https://platform.deepseek.com',
+    'zhipu': 'https://open.bigmodel.cn',
+    'qwen': 'https://dashscope.console.aliyun.com',
+    'doubao': 'https://console.volcengine.com/ark'
+}};
+
+const modelNames = {{
+    'deepseek': 'DeepSeek',
+    'zhipu': '智谱AI',
+    'qwen': '通义千问',
+    'doubao': '豆包'
+}};
+
+function updateModelInfo(){{
+    let provider = document.getElementById('apiProvider').value;
+    document.getElementById('modelUrl').href = modelUrls[provider];
+    document.getElementById('modelUrl').textContent = modelUrls[provider];
+}}
 
 // 检查API Key状态
 async function checkApiStatus(){{
     let res = await fetch('/api/user/apikey');
     let data = await res.json();
     userApiKey = data.api_key || '';
+    userApiProvider = data.api_provider || 'deepseek';
 
     let statusEl = document.getElementById('apiStatus');
     if(userApiKey){{
         statusEl.className = 'api-status api-set';
-        statusEl.innerHTML = '✅ API Key已设置 <a href="#" onclick="showApiKeyModal()" style="margin-left:10px;color:#e91e63">修改</a>';
+        statusEl.innerHTML = '✅ ' + modelNames[userApiProvider] + ' 已设置 <a href="#" onclick="showApiKeyModal()" style="margin-left:10px;color:#e91e63">修改</a>';
     }} else {{
         statusEl.className = 'api-status api-notset';
-        statusEl.innerHTML = '⚠️ 未设置API Key <a href="#" onclick="showApiKeyModal()" style="margin-left:10px;color:#e91e63">设置</a>';
+        statusEl.innerHTML = '⚠️ 未设置AI模型 <a href="#" onclick="showApiKeyModal()" style="margin-left:10px;color:#e91e63">设置</a>';
     }}
 }}
 
 function showApiKeyModal(){{
+    document.getElementById('apiProvider').value = userApiProvider;
     document.getElementById('apiKeyInput').value = userApiKey;
+    updateModelInfo();
     document.getElementById('apiKeyModal').classList.add('show');
 }}
 
@@ -916,14 +1015,16 @@ function closeApiKeyModal(){{
 
 async function saveApiKey(){{
     let key = document.getElementById('apiKeyInput').value.trim();
+    let provider = document.getElementById('apiProvider').value;
     let res = await fetch('/api/user/apikey', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
-        body: JSON.stringify({{api_key: key}})
+        body: JSON.stringify({{api_key: key, api_provider: provider}})
     }});
     let data = await res.json();
     if(data.success){{
         userApiKey = key;
+        userApiProvider = provider;
         closeApiKeyModal();
         checkApiStatus();
     }}
@@ -1131,15 +1232,16 @@ def upload_check():
 
     user = get_user_by_username(session['user'])
     api_key = user.get('api_key', '')
+    api_provider = user.get('api_provider', 'deepseek')
 
-    full_info = extract_info_from_pdf(path, filename, api_key)
+    full_info = extract_info_from_pdf(path, filename, api_key, api_provider)
     os.remove(path)
 
     if not full_info:
         return jsonify({"error": "extract failed"}), 500
 
     papers = load_papers()
-    dup, paper = check_duplicate(full_info, papers, api_key)
+    dup, paper = check_duplicate(full_info, papers, api_key, api_provider)
 
     return jsonify({
         "title": full_info['title'],
