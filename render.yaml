@@ -8,6 +8,5 @@ services:
     envVars:
       - key: SECRET_KEY
         generateValue: true
-    databases:
-      - name: paper-check-db
-        plan: free
+      - key: PYTHON_VERSION
+        value: 3.11
