@@ -17,17 +17,19 @@ DATABASE_URL = os.environ.get('DATABASE_URL')
 USE_POSTGRES = DATABASE_URL is not None
 
 if USE_POSTGRES:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
+    import psycopg
+    from psycopg.rows import dict_row
 
     def get_db_connection():
-        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 else:
     import sqlite3
     DB_FILE = "papers.db"
 
     def get_db_connection():
-        return sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        return conn
 
 # 支持的AI模型配置
 AI_MODELS = {
