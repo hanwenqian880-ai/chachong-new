@@ -5,3 +5,9 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
     plan: free
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+    databases:
+      - name: paper-check-db
+        plan: free

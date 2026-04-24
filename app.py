@@ -1,7 +1,6 @@
 import os
 import re
 import json
-import sqlite3
 import hashlib
 import requests
 from flask import Flask, request, jsonify, session
@@ -9,11 +8,26 @@ from werkzeug.utils import secure_filename
 from pypdf import PdfReader
 
 app = Flask(__name__)
-app.secret_key = 'your-secret-key-change-in-production'
+app.secret_key = os.environ.get('SECRET_KEY', 'your-secret-key-change-in-production')
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-DB_FILE = "papers.db"
+# 数据库配置 - 支持PostgreSQL（云端）和SQLite（本地）
+DATABASE_URL = os.environ.get('DATABASE_URL')
+USE_POSTGRES = DATABASE_URL is not None
+
+if USE_POSTGRES:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+
+    def get_db_connection():
+        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+else:
+    import sqlite3
+    DB_FILE = "papers.db"
+
+    def get_db_connection():
+        return sqlite3.connect(DB_FILE)
 
 # 支持的AI模型配置
 AI_MODELS = {
@@ -51,12 +65,12 @@ AI_MODELS = {
 # 初始化数据库
 # ----------------------
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
 
     # 文献表
     c.execute('''CREATE TABLE IF NOT EXISTS papers
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 (id SERIAL PRIMARY KEY,
                   title TEXT,
                   author TEXT,
                   year TEXT,
@@ -64,26 +78,20 @@ def init_db():
 
     # 用户表
     c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 (id SERIAL PRIMARY KEY,
                   username TEXT UNIQUE,
                   password TEXT,
                   api_key TEXT,
                   api_provider TEXT DEFAULT 'deepseek',
                   is_admin INTEGER DEFAULT 0)''')
 
-    # 检查是否需要添加新字段
-    c.execute("PRAGMA table_info(users)")
-    columns = [col[1] for col in c.fetchall()]
-    if 'is_admin' not in columns:
-        c.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
-    if 'api_provider' not in columns:
-        c.execute("ALTER TABLE users ADD COLUMN api_provider TEXT DEFAULT 'deepseek'")
+    conn.commit()
 
     # 创建默认管理员账号
     c.execute("SELECT * FROM users WHERE username = 'admin'")
     if not c.fetchone():
-        c.execute("INSERT INTO users (username, password, api_key, api_provider, is_admin) VALUES (?, ?, ?, ?, 1)",
-                  ('admin', hash_password('admin123'), '', 'deepseek'))
+        c.execute("INSERT INTO users (username, password, api_key, api_provider, is_admin) VALUES (%s, %s, %s, %s, %s)",
+                  ('admin', hash_password('admin123'), '', 'deepseek', 1))
 
     conn.commit()
     conn.close()
@@ -97,50 +105,58 @@ def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 # ----------------------
+# 数据库操作辅助函数
+# ----------------------
+def db_execute(query, params=(), fetch=False, fetch_one=False):
+    """统一的数据库执行函数，兼容PostgreSQL和SQLite"""
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    # PostgreSQL用%s，SQLite用?
+    if USE_POSTGRES:
+        query = query.replace('?', '%s')
+
+    c.execute(query, params)
+
+    if fetch_one:
+        result = c.fetchone()
+        conn.close()
+        return dict(result) if result else None
+    elif fetch:
+        results = c.fetchall()
+        conn.close()
+        return [dict(r) for r in results]
+    else:
+        conn.commit()
+        conn.close()
+        return None
+
+# ----------------------
 # 用户相关函数
 # ----------------------
 def get_user_by_username(username):
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE username = ?", (username,))
-    row = c.fetchone()
-    conn.close()
-    return dict(row) if row else None
+    return db_execute("SELECT * FROM users WHERE username = ?", (username,), fetch_one=True)
 
 def create_user(username, password):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
     try:
-        c.execute("INSERT INTO users (username, password, api_key, is_admin) VALUES (?, ?, ?, 0)",
-                  (username, hash_password(password), ''))
-        conn.commit()
-        conn.close()
+        db_execute("INSERT INTO users (username, password, api_key, api_provider, is_admin) VALUES (?, ?, ?, ?, 0)",
+                   (username, hash_password(password), '', 'deepseek'))
         return True
     except:
-        conn.close()
         return False
 
 def update_user_api_key(username, api_key, api_provider='deepseek'):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("UPDATE users SET api_key = ?, api_provider = ? WHERE username = ?", (api_key, api_provider, username))
-    conn.commit()
-    conn.close()
+    db_execute("UPDATE users SET api_key = ?, api_provider = ? WHERE username = ?", (api_key, api_provider, username))
 
 def get_all_users():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT id, username, is_admin, api_provider FROM users")
-    rows = c.fetchall()
-    conn.close()
-    return [{"id": r["id"], "username": r["username"], "is_admin": r["is_admin"], "api_provider": r["api_provider"]} for r in rows]
+    rows = db_execute("SELECT id, username, is_admin, api_provider FROM users", fetch=True)
+    return rows if rows else []
 
 def delete_user_by_id(user_id):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("DELETE FROM users WHERE id = ? AND is_admin = 0", (user_id,))
+    query = "DELETE FROM users WHERE id = %s AND is_admin = 0" if USE_POSTGRES else "DELETE FROM users WHERE id = ? AND is_admin = 0"
+    c.execute(query, (user_id,))
     conn.commit()
     affected = c.rowcount
     conn.close()
@@ -150,40 +166,36 @@ def delete_user_by_id(user_id):
 # 文献相关函数
 # ----------------------
 def load_papers():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT title, author, year, filename FROM papers")
-    rows = c.fetchall()
-    conn.close()
-    return [{"title": r["title"], "author": r["author"], "year": r["year"], "filename": r["filename"]} for r in rows]
+    rows = db_execute("SELECT title, author, year, filename FROM papers", fetch=True)
+    return rows if rows else []
 
 def add_paper_to_db(paper):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT INTO papers (title, author, year, filename) VALUES (?, ?, ?, ?)",
-              (paper["title"], paper["author"], paper["year"], paper.get("filename", "")))
-    conn.commit()
-    conn.close()
+    db_execute("INSERT INTO papers (title, author, year, filename) VALUES (?, ?, ?, ?)",
+               (paper["title"], paper["author"], paper["year"], paper.get("filename", "")))
 
 def update_paper_in_db(index, paper):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT id FROM papers ORDER BY id LIMIT 1 OFFSET ?", (index,))
+    query = "SELECT id FROM papers ORDER BY id LIMIT 1 OFFSET %s" if USE_POSTGRES else "SELECT id FROM papers ORDER BY id LIMIT 1 OFFSET ?"
+    c.execute(query, (index,))
     row = c.fetchone()
     if row:
-        c.execute("UPDATE papers SET title=?, author=?, year=?, filename=? WHERE id=?",
-                  (paper["title"], paper["author"], paper["year"], paper.get("filename", ""), row[0]))
+        row_id = row['id'] if USE_POSTGRES else row[0]
+        query = "UPDATE papers SET title=%s, author=%s, year=%s, filename=%s WHERE id=%s" if USE_POSTGRES else "UPDATE papers SET title=?, author=?, year=?, filename=? WHERE id=?"
+        c.execute(query, (paper["title"], paper["author"], paper["year"], paper.get("filename", ""), row_id))
         conn.commit()
     conn.close()
 
 def delete_paper_from_db(index):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT id FROM papers ORDER BY id LIMIT 1 OFFSET ?", (index,))
+    query = "SELECT id FROM papers ORDER BY id LIMIT 1 OFFSET %s" if USE_POSTGRES else "SELECT id FROM papers ORDER BY id LIMIT 1 OFFSET ?"
+    c.execute(query, (index,))
     row = c.fetchone()
     if row:
-        c.execute("DELETE FROM papers WHERE id=?", (row[0],))
+        row_id = row['id'] if USE_POSTGRES else row[0]
+        query = "DELETE FROM papers WHERE id=%s" if USE_POSTGRES else "DELETE FROM papers WHERE id=?"
+        c.execute(query, (row_id,))
         conn.commit()
     conn.close()
 
